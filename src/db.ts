@@ -103,10 +103,23 @@ export async function addToCart(env: Env, session: Session, product: Product): P
 export async function saveOrder(env: Env, session: Session): Promise<number> {
   const cart = readCart(session);
   const total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const snapshot = new Map<string, { ingredient_id: string; quantity: number; unit_cost: number }>();
+  let cost = 0;
+  for (const item of cart) {
+    const recipe = await env.DB.prepare(
+      "SELECT r.insumo_id,r.cantidad,i.costo_unitario FROM recetas r JOIN insumos i ON i.id=r.insumo_id WHERE r.producto_id=? AND i.activo=1",
+    ).bind(item.productId).all<{ insumo_id: string; cantidad: number; costo_unitario: number }>();
+    for (const row of recipe.results) {
+      const quantity = Number(row.cantidad) * item.quantity;
+      const old = snapshot.get(row.insumo_id);
+      snapshot.set(row.insumo_id, { ingredient_id: row.insumo_id, quantity: quantity + (old?.quantity ?? 0), unit_cost: Number(row.costo_unitario) });
+      cost += quantity * Number(row.costo_unitario);
+    }
+  }
   const result = await env.DB.prepare(`
     INSERT INTO pedidos
-      (telefono, nombre_cliente, carrito_json, total, direccion, latitud, longitud, metodo_pago, metodo_entrega, estado)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECIBIDO')
+      (telefono, nombre_cliente, carrito_json, total, direccion, latitud, longitud, metodo_pago, metodo_entrega, estado, costo_insumos, receta_snapshot_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECIBIDO', ?, ?)
   `).bind(
     session.telefono,
     session.nombre_cliente ?? "",
@@ -117,6 +130,8 @@ export async function saveOrder(env: Env, session: Session): Promise<number> {
     session.longitud,
     session.metodo_pago ?? "",
     session.metodo_entrega ?? "DOMICILIO",
+    cost,
+    JSON.stringify([...snapshot.values()]),
   ).run();
 
   session.paso = "INICIO";

@@ -3,6 +3,7 @@ import { markMessageProcessed } from "./db";
 import type { Env, WhatsAppMessage } from "./types";
 import { dataDeletionPage, privacyPolicyPage } from "./privacy";
 import { handleAdmin } from "./admin";
+import { handlePos } from "./pos";
 
 function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -33,6 +34,8 @@ export default {
     console.log("Webhook request", request.method, url.pathname);
     const adminResponse = await handleAdmin(request, env);
     if (adminResponse) return adminResponse;
+    const posResponse = await handlePos(request, env);
+    if (posResponse) return posResponse;
     if (request.method === "GET" && url.pathname === "/privacy") return privacyPolicyPage();
     if (request.method === "GET" && url.pathname === "/data-deletion") return dataDeletionPage();
     if (url.pathname !== "/webhook") return new Response("La Salvajada WhatsApp bot", { status: 200 });

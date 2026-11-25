@@ -16,6 +16,8 @@ interface AdminOrder {
   creado_en: string;
   adiciones_json: string;
   modificado_en: string | null;
+  mensaje_entrega_estado: string;
+  mensaje_entrega_error: string | null;
 }
 
 interface IncomeSummary {
@@ -75,10 +77,24 @@ const ADMIN_SCRIPT = `(function(){
       var deliver=document.createElement('button');
       deliver.type='submit'; deliver.className='action-button deliver'; deliver.textContent='✓ Marcar entregado';
       deliverForm.appendChild(deliver);
-      actions.replaceChildren(note, deliverForm, makeSendButton());
+      if (row.getAttribute('data-message-sent') === 'true') {
+        var sentNote = document.createElement('span');
+        sentNote.className = 'action-note';
+        sentNote.textContent = 'Mensaje enviado por WhatsApp';
+        actions.replaceChildren(note, deliverForm, sentNote);
+      } else {
+        actions.replaceChildren(note, deliverForm, makeSendButton());
+      }
     } else if (state === 'ENTREGADO') {
       note.textContent = 'Pedido entregado · Ingreso registrado';
-      actions.replaceChildren(note, makeSendButton());
+      if (row.getAttribute('data-message-sent') === 'true') {
+        var deliveredNote = document.createElement('span');
+        deliveredNote.className = 'action-note';
+        deliveredNote.textContent = 'Mensaje enviado por WhatsApp';
+        actions.replaceChildren(note, deliveredNote);
+      } else {
+        actions.replaceChildren(note, makeSendButton());
+      }
     }
   }
   document.addEventListener('click', function(event) {
@@ -154,12 +170,8 @@ const ADMIN_SCRIPT = `(function(){
       if (!response.ok || !result.ok) throw new Error(result.message || 'No se pudo enviar el mensaje.');
       dialog.close();
       var row = document.querySelector('tr[data-order-id="' + activeOrderId + '"]');
-      var actions = row.querySelector('.actions-cell .row-actions');
-      var note = document.createElement('span');
-      note.className = 'action-note';
       row.setAttribute('data-message-sent', 'true');
-      note.textContent = 'Mensaje enviado por WhatsApp';
-      actions.appendChild(note);
+      renderActions(row, row.dataset.status);
       showNotice('Mensaje enviado por WhatsApp.', false);
     } catch (error) {
       sendButton.disabled = false;
@@ -282,7 +294,8 @@ async function ordersPage(env: Env, notice = ""): Promise<Response> {
   const [result, income, orderSummary] = await Promise.all([
     env.DB.prepare(`
     SELECT id, telefono, nombre_cliente, carrito_json, total, direccion,
-           latitud, longitud, metodo_pago, metodo_entrega, estado, creado_en, adiciones_json, modificado_en
+           latitud, longitud, metodo_pago, metodo_entrega, estado, creado_en, adiciones_json, modificado_en,
+           mensaje_entrega_estado, mensaje_entrega_error
     FROM pedidos ORDER BY id DESC LIMIT 100
     `).all<AdminOrder>(),
     env.DB.prepare(`
@@ -316,14 +329,17 @@ async function ordersPage(env: Env, notice = ""): Promise<Response> {
     const cancelled = order.estado === "CANCELADO";
     const pending = order.estado === "RECIBIDO";
     const statusPill = `<span class="pill${pending ? " pending" : ""}${done ? " done" : ""}${cancelled ? " cancelled" : ""}">${escapeHtml(order.estado)}</span>`;
+    const sendMessageAction = order.mensaje_entrega_estado === "ENVIADO"
+      ? `<span class="action-note">Mensaje enviado por WhatsApp</span>`
+      : `${order.mensaje_entrega_estado === "ERROR" ? `<span class="action-note">No se pudo enviar el mensaje. Puedes reintentar.</span>` : ""}<button class="action-button send" type="button" data-send-order>Enviar mensaje</button>`;
     const actions = cancelled
       ? `<span class="action-note">Pedido cancelado</span>`
       : order.estado === "RECIBIDO"
         ? `<span class="action-note">Pedido recibido por WhatsApp</span><form method="post" action="/admin/finish"><input type="hidden" name="id" value="${escapeHtml(order.id)}"><button class="action-button finish" type="submit">✓ Marcar terminado</button></form>`
-        : order.estado === "TERMINADO"
-          ? `<span class="action-note">Pedido terminado</span><form method="post" action="/admin/deliver"><input type="hidden" name="id" value="${escapeHtml(order.id)}"><button class="action-button deliver" type="submit">✓ Marcar entregado</button></form><button class="action-button send" type="button" data-send-order>Enviar mensaje</button>`
-          : `<span class="action-note">Pedido entregado · Ingreso registrado</span><button class="action-button send" type="button" data-send-order>Enviar mensaje</button>`;
-    return `<tr data-order-id="${escapeHtml(order.id)}" data-status="${escapeHtml(order.estado)}" data-total="${Number(order.total)}" data-payment="${escapeHtml(order.metodo_pago)}"><td class="order-cell" data-label="Pedido"><div class="mobile-order-head"><span class="order-id">#${escapeHtml(order.id)}</span>${statusPill}</div><small class="order-time">${escapeHtml(order.creado_en)}</small></td><td class="client-cell" data-label="Cliente"><strong>${escapeHtml(order.nombre_cliente)}</strong><small class="phone">${escapeHtml(displayPhone(order.telefono))}</small></td><td class="products-cell" data-label="Productos"><div class="item-list">${cartItems(order.carrito_json)}</div>${modification}</td><td class="total-cell" data-label="Total"><strong>$${Number(order.total).toLocaleString("es-CO")}</strong></td><td class="payment-cell" data-label="Pago">${escapeHtml(order.metodo_pago)}</td><td class="fulfillment-cell" data-label="Entrega">${pickup ? "Recoger en el local" : "Domicilio"}</td><td class="address address-cell" data-label="Dirección">${pickup ? "No requiere dirección" : `${escapeHtml(order.direccion)}<br>${location}`}</td><td class="status-cell" data-label="Estado">${statusPill}</td><td class="actions-cell" data-label="Acciones"><div class="row-actions">${actions}</div></td></tr>`;
+      : order.estado === "TERMINADO"
+          ? `<span class="action-note">Pedido terminado</span><form method="post" action="/admin/deliver"><input type="hidden" name="id" value="${escapeHtml(order.id)}"><button class="action-button deliver" type="submit">✓ Marcar entregado</button></form>${sendMessageAction}`
+          : `<span class="action-note">Pedido entregado · Ingreso registrado</span>${sendMessageAction}`;
+    return `<tr data-order-id="${escapeHtml(order.id)}" data-status="${escapeHtml(order.estado)}" data-message-sent="${order.mensaje_entrega_estado === "ENVIADO" ? "true" : "false"}" data-total="${Number(order.total)}" data-payment="${escapeHtml(order.metodo_pago)}"><td class="order-cell" data-label="Pedido"><div class="mobile-order-head"><span class="order-id">#${escapeHtml(order.id)}</span>${statusPill}</div><small class="order-time">${escapeHtml(order.creado_en)}</small></td><td class="client-cell" data-label="Cliente"><strong>${escapeHtml(order.nombre_cliente)}</strong><small class="phone">${escapeHtml(displayPhone(order.telefono))}</small></td><td class="products-cell" data-label="Productos"><div class="item-list">${cartItems(order.carrito_json)}</div>${modification}</td><td class="total-cell" data-label="Total"><strong>$${Number(order.total).toLocaleString("es-CO")}</strong></td><td class="payment-cell" data-label="Pago">${escapeHtml(order.metodo_pago)}</td><td class="fulfillment-cell" data-label="Entrega">${pickup ? "Recoger en el local" : "Domicilio"}</td><td class="address address-cell" data-label="Dirección">${pickup ? "No requiere dirección" : `${escapeHtml(order.direccion)}<br>${location}`}</td><td class="status-cell" data-label="Estado">${statusPill}</td><td class="actions-cell" data-label="Acciones"><div class="row-actions">${actions}</div></td></tr>`;
   }).join("");
   const notices: Record<string, string> = {
     finished: "Pedido marcado como terminado.",
@@ -361,9 +377,10 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response 
     if (!(await isAuthenticated(request, env))) return loginPage("Inicia sesión para gestionar los pedidos.");
     const id = Number(url.searchParams.get("id"));
     if (!Number.isSafeInteger(id) || id < 1) return new Response("Pedido inválido", { status: 400 });
-    const order = await env.DB.prepare("SELECT id, telefono, nombre_cliente, estado FROM pedidos WHERE id = ?").bind(id).first<{ id: number; telefono: string; nombre_cliente: string; estado: string }>();
+    const order = await env.DB.prepare("SELECT id, telefono, nombre_cliente, estado, mensaje_entrega_estado FROM pedidos WHERE id = ?").bind(id).first<{ id: number; telefono: string; nombre_cliente: string; estado: string; mensaje_entrega_estado: string }>();
     if (!order) return new Response(null, { status: 303, headers: { Location: "/admin?notice=order-error", "Cache-Control": "no-store" } });
     if (order.estado !== "TERMINADO") return new Response(null, { status: 303, headers: { Location: "/admin?notice=must-finish", "Cache-Control": "no-store" } });
+    if (order.mensaje_entrega_estado === "ENVIADO") return new Response(null, { status: 303, headers: { Location: "/admin?notice=sent", "Cache-Control": "no-store" } });
     const message = `Hola ${order.nombre_cliente}, tu pedido de La Salvajada de Willian está listo. ¡Gracias por tu compra!`;
     return html(`<main class="login-shell"><section class="login"><img class="brand-logo" src="/logo.png" alt="La Salvajada de Willian"><p class="eyebrow">Confirmación de envío</p><h1>¿Enviar este mensaje?</h1><p>Verifica que el pedido y el destinatario sean correctos antes de enviarlo.</p><div style="background:#f7f4ef;border:1px solid #ebe5dc;border-radius:12px;padding:16px;margin:18px 0"><strong>Pedido #${escapeHtml(order.id)}</strong><div style="margin-top:8px">Destinatario: <strong>${escapeHtml(order.nombre_cliente)}</strong><br><span class="muted">${escapeHtml(displayPhone(order.telefono))}</span></div><div style="margin-top:14px;color:#49443e">${escapeHtml(message)}</div></div><form method="post" action="/admin/send"><input type="hidden" name="id" value="${escapeHtml(order.id)}"><button class="button" type="submit">Confirmar y enviar mensaje</button></form><a class="button dark" style="width:100%;margin-top:10px" href="/admin">Cancelar y volver</a></section></main>`);
   }
@@ -377,7 +394,7 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response 
     const form = await request.formData();
     const id = Number(form.get("id"));
     if (!Number.isSafeInteger(id) || id < 1) return actionResult(request, false, "Pedido inválido.", "order-error", 400);
-    const order = await env.DB.prepare("SELECT id, telefono, nombre_cliente, estado FROM pedidos WHERE id = ?").bind(id).first<{ id: number; telefono: string; nombre_cliente: string; estado: string }>();
+    const order = await env.DB.prepare("SELECT id, telefono, nombre_cliente, estado, mensaje_entrega_estado FROM pedidos WHERE id = ?").bind(id).first<{ id: number; telefono: string; nombre_cliente: string; estado: string; mensaje_entrega_estado: string }>();
     if (!order) return actionResult(request, false, "No se encontró ese pedido.", "order-error", 404);
     if (url.pathname === "/admin/finish") {
       if (order.estado !== "RECIBIDO") return actionResult(request, false, "Solo se puede terminar un pedido recibido.", "must-finish", 409);
@@ -389,8 +406,11 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response 
       if (order.estado !== "TERMINADO") return actionResult(request, false, "Solo se puede registrar el ingreso después de terminar el pedido.", "must-finish", 409);
       const results = await env.DB.batch([
         env.DB.prepare(`
-          INSERT INTO ingresos (pedido_id, monto, metodo_pago)
-          SELECT id, total, metodo_pago FROM pedidos
+          INSERT INTO ingresos (pedido_id, monto, metodo_pago, monto_efectivo, monto_transferencia)
+          SELECT id, total, metodo_pago,
+            CASE WHEN LOWER(metodo_pago) = 'efectivo' THEN total ELSE 0 END,
+            CASE WHEN LOWER(metodo_pago) = 'efectivo' THEN 0 ELSE total END
+          FROM pedidos
           WHERE id = ? AND estado = 'TERMINADO'
           ON CONFLICT(pedido_id) DO NOTHING
         `).bind(id),
@@ -400,8 +420,10 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response 
       return actionResult(request, true, "Pedido entregado y registrado como ingreso.", "delivered");
     }
     if (order.estado !== "TERMINADO" && order.estado !== "ENTREGADO") return actionResult(request, false, "Marca el pedido como terminado antes de enviar el mensaje.", "must-finish", 409);
+    if (order.mensaje_entrega_estado === "ENVIADO") return actionResult(request, false, "El mensaje de entrega ya se envió.", "already-sent", 409);
     try {
       await sendText(env, order.telefono, `Hola ${order.nombre_cliente}, tu pedido de La Salvajada de Willian está listo. ¡Gracias por tu compra!`);
+      await env.DB.prepare("UPDATE pedidos SET mensaje_entrega_estado='ENVIADO',mensaje_entrega_error=NULL WHERE id=?").bind(id).run();
       return actionResult(request, true, "Mensaje enviado al cliente por WhatsApp.", "sent");
     } catch {
       return actionResult(request, false, "No se pudo enviar. Revisa el token y la ventana de 24 horas de WhatsApp.", "send-error", 502);

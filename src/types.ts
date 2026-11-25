@@ -5,6 +5,7 @@ export interface Env {
   VERIFY_TOKEN: string;
   META_APP_SECRET: string;
   ADMIN_PASSWORD?: string;
+  POS_AUTH_SECRET?: string;
   GRAPH_API_VERSION?: string;
   RESTAURANT_NAME?: string;
   OWNER_WHATSAPP?: string;

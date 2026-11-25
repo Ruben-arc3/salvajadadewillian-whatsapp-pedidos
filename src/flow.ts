@@ -49,15 +49,25 @@ async function showHome(env: Env, phone: string): Promise<void> {
     { id: "ORDER", title: "Hacer pedido" },
     { id: "INFO", title: "Horario y ubicación" },
   ]);
+  const pending = await env.DB.prepare(
+    "SELECT id FROM pedidos WHERE telefono = ? AND estado IN ('RECIBIDO','TERMINADO') ORDER BY id DESC LIMIT 1",
+  ).bind(phone).first<{ id: number }>();
+  if (pending) await showCancelOption(env, phone, `Opciones para tu pedido #${pending.id}:`);
 }
 
-async function showMenu(env: Env, phone: string): Promise<void> {
+async function showCancelOption(env: Env, phone: string, prompt = "¿Deseas cancelar este pedido?"): Promise<void> {
+  await sendButtons(env, phone, prompt, [{ id: "CANCEL_ORDER", title: "Cancelar" }]);
+}
+
+async function showMenu(env: Env, phone: string, cancellable = false): Promise<void> {
   const categories = await getCategories(env);
   if (!categories.length) {
     await sendText(env, phone, "Estamos actualizando el menú. Escríbenos en unos minutos o pide hablar con un encargado.");
+    if (cancellable) await showCancelOption(env, phone);
     return;
   }
   await sendCategoryList(env, phone, categories);
+  if (cancellable) await showCancelOption(env, phone);
 }
 
 async function askPayment(env: Env, session: Session): Promise<void> {
@@ -66,6 +76,7 @@ async function askPayment(env: Env, session: Session): Promise<void> {
   await sendButtons(env, session.telefono, "¿Cómo deseas pagar?", [
     { id: "PAYMENT:TRANSFER", title: "Transferencia" },
     { id: "PAYMENT:CASH", title: "Efectivo" },
+    { id: "CANCEL_ORDER", title: "Cancelar" },
   ]);
 }
 
@@ -78,12 +89,99 @@ async function requestHuman(env: Env, session: Session): Promise<void> {
   }
 }
 
+function clearOrderDraft(session: Session): void {
+  session.paso = "INICIO";
+  session.carrito_json = "[]";
+  session.carrito_base_json = "[]";
+  session.nombre_cliente = null;
+  session.direccion = null;
+  session.latitud = null;
+  session.longitud = null;
+  session.metodo_pago = null;
+  session.metodo_entrega = null;
+}
+
+function isCancellationRequest(command: string, id: string, step: string): boolean {
+  if (id === "CANCEL_ORDER") return true;
+  if (command === "2" && (step === "INICIO" || step === "HUMANO")) return true;
+  return command.includes("cancel") || command.includes("anul");
+}
+
+async function cancelOrder(env: Env, session: Session): Promise<void> {
+  const phone = session.telefono;
+  const editingMatch = session.paso.match(/^AGREGANDO_A_PEDIDO:(\d+)$/);
+  const editingOrderId = editingMatch ? Number(editingMatch[1]) : null;
+  const isDraft = [
+    "ELIGIENDO_PRODUCTOS",
+    "PIDIENDO_ENTREGA",
+    "PIDIENDO_NOMBRE",
+    "PIDIENDO_DIRECCION",
+    "PIDIENDO_UBICACION",
+    "PIDIENDO_METODO_PAGO",
+    "CONFIRMANDO",
+  ].includes(session.paso);
+
+  if (isDraft && !editingOrderId) {
+    clearOrderDraft(session);
+    await saveSession(env, session);
+    await sendText(env, phone, "Cancelé el pedido en curso. No se envió al restaurante ni se registró. Cuando quieras, puedes empezar de nuevo.");
+    await showHome(env, phone);
+    return;
+  }
+
+  const pending = editingOrderId
+    ? await env.DB.prepare("SELECT id, estado FROM pedidos WHERE id = ? AND telefono = ? AND estado IN ('RECIBIDO','TERMINADO')")
+      .bind(editingOrderId, phone).first<{ id: number; estado: string }>()
+    : await env.DB.prepare("SELECT id, estado FROM pedidos WHERE telefono = ? AND estado IN ('RECIBIDO','TERMINADO') ORDER BY id DESC LIMIT 1")
+      .bind(phone).first<{ id: number; estado: string }>();
+
+  if (pending?.estado === "RECIBIDO") {
+    const result = await env.DB.prepare("UPDATE pedidos SET estado = 'CANCELADO' WHERE id = ? AND telefono = ? AND estado = 'RECIBIDO'")
+      .bind(pending.id, phone).run();
+    clearOrderDraft(session);
+    await saveSession(env, session);
+    if (result.meta.changes !== 1) {
+      await sendText(env, phone, "No pude cancelar el pedido porque su estado cambió. Escribe “Hablar con un encargado” para que te ayuden.");
+      return;
+    }
+    await sendText(env, phone, `Cancelé tu pedido #${pending.id}. Si fue un error, escribe “Hacer pedido” para comenzar otro.`);
+    await showHome(env, phone);
+    return;
+  }
+
+  if (pending?.estado === "TERMINADO") {
+    session.paso = "HUMANO";
+    await saveSession(env, session);
+    if (env.OWNER_WHATSAPP) {
+      await sendText(env, phone, "Tu pedido ya está en preparación. Envié tu solicitud de cancelación al encargado para que confirme si todavía es posible detenerlo.");
+      await sendText(env, env.OWNER_WHATSAPP, `Solicitud de cancelación del pedido #${pending.id} de ${phone}. El pedido ya está en preparación; revisa y responde al cliente.`);
+    } else {
+      await sendText(env, phone, "Tu pedido ya está en preparación y no puedo cancelarlo automáticamente. Contacta directamente al restaurante para solicitar ayuda.");
+    }
+    return;
+  }
+
+  if (isDraft || editingOrderId) {
+    clearOrderDraft(session);
+    await saveSession(env, session);
+  }
+  await sendText(env, phone, "No tienes un pedido en curso que se pueda cancelar.");
+  if (session.paso !== "HUMANO") await showHome(env, phone);
+}
+
 export async function handleMessage(env: Env, message: WhatsAppMessage): Promise<void> {
   const phone = message.from;
   const session = await getSession(env, phone);
   const text = textOf(message);
   const command = normalize(text);
   const id = replyId(message);
+
+  // Handle cancellation before the human handoff and state-specific branches so
+  // customers can ask to cancel from any point in the guided flow.
+  if (isCancellationRequest(command, id, session.paso)) {
+    await cancelOrder(env, session);
+    return;
+  }
 
   if (
     (command.includes("hablar") && command.includes("encargado")) ||
@@ -103,9 +201,8 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     return;
   }
 
-  const cancelCommand = command === "1" || command === "1 cancelar" || command === "1 cancelar pedido" || command === "cancelar pedido";
-  const addCommand = command === "2" || command === "2 agregar" || command === "2 agregar algo" || command === "agregar algo";
-  if (cancelCommand || addCommand) {
+  const addCommand = id === "ADD_ORDER" || command === "1 agregar" || command === "1 agregar algo" || command === "agregar algo" || (command === "1" && (session.paso === "INICIO" || session.paso === "HUMANO"));
+  if (addCommand) {
     const activeOrder = await env.DB.prepare(
       "SELECT id, carrito_json FROM pedidos WHERE telefono = ? AND estado = 'RECIBIDO' ORDER BY id DESC LIMIT 1",
     ).bind(phone).first<{ id: number; carrito_json: string }>();
@@ -113,29 +210,19 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
       await sendText(env, phone, "No tienes un pedido pendiente que se pueda modificar o cancelar.");
       return;
     }
-    if (cancelCommand) {
-      await env.DB.prepare("UPDATE pedidos SET estado = 'CANCELADO' WHERE id = ? AND telefono = ? AND estado = 'RECIBIDO'")
-        .bind(activeOrder.id, phone).run();
-      session.paso = "INICIO";
-      session.carrito_json = "[]";
-      session.carrito_base_json = "[]";
-      await saveSession(env, session);
-      await sendText(env, phone, "Tu pedido fue cancelado. Si fue un error o ya se empezó a preparar, escribe “Hablar con un encargado”.");
-      return;
-    }
     session.paso = `AGREGANDO_A_PEDIDO:${activeOrder.id}`;
     session.carrito_json = activeOrder.carrito_json;
     session.carrito_base_json = activeOrder.carrito_json;
     await saveSession(env, session);
     await sendText(env, phone, "Claro, elige los productos que deseas agregar. Al terminar, toca “Continuar” para guardar los cambios en tu pedido.");
-    await showMenu(env, phone);
+    await showMenu(env, phone, true);
     return;
   }
 
   if (id === "MENU" || id === "ORDER") {
     session.paso = "ELIGIENDO_PRODUCTOS";
     await saveSession(env, session);
-    await showMenu(env, phone);
+    await showMenu(env, phone, true);
     return;
   }
   if (id === "INFO" || command === "horario" || command === "ubicacion" || command === "ubicación") {
@@ -144,7 +231,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     return;
   }
   if (id === "MORE") {
-    await showMenu(env, phone);
+    await showMenu(env, phone, true);
     return;
   }
   if (id.startsWith("CATEGORY:")) {
@@ -152,10 +239,11 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     const categories = await getCategories(env);
     const category = categories[index];
     if (!category) {
-      await showMenu(env, phone);
+      await showMenu(env, phone, true);
       return;
     }
     await sendProductList(env, phone, await getProducts(env, category));
+    await showCancelOption(env, phone);
     return;
   }
   if (id === "CHECKOUT") {
@@ -182,7 +270,11 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
         await sendText(env, phone, "No pude modificar el pedido porque ya no está pendiente. Escribe “Hablar con un encargado” para recibir ayuda.");
         return;
       }
-      await sendText(env, phone, `Listo, agregué los productos a tu pedido.\n${cartSummary(cart)}\n\nSi necesitas otro cambio, escribe:\n1. Cancelar pedido\n2. Agregar algo`);
+      await sendText(env, phone, `Listo, agregué los productos a tu pedido.\n${cartSummary(cart)}`);
+      await sendButtons(env, phone, "¿Qué deseas hacer con tu pedido?", [
+        { id: "ADD_ORDER", title: "1. Agregar algo" },
+        { id: "CANCEL_ORDER", title: "2. Cancelar" },
+      ]);
       return;
     }
     session.paso = "PIDIENDO_ENTREGA";
@@ -190,6 +282,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     await sendButtons(env, phone, "¿Lo deseas a domicilio o lo recogerás en el local?", [
       { id: "DELIVERY:HOME", title: "Domicilio" },
       { id: "DELIVERY:PICKUP", title: "Recoger en el local" },
+      { id: "CANCEL_ORDER", title: "Cancelar" },
     ]);
     return;
   }
@@ -197,7 +290,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     const product = await getProduct(env, id.slice("PRODUCT:".length));
     if (!product) {
       await sendText(env, phone, "Ese producto ya no está disponible. Te muestro el menú actualizado.");
-      await showMenu(env, phone);
+      await showMenu(env, phone, true);
       return;
     }
     const cart = await addToCart(env, session, product);
@@ -206,6 +299,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
       { id: "CHECKOUT", title: "Continuar" },
       { id: "HUMAN", title: "Hablar encargado" },
     ]);
+    await showCancelOption(env, phone);
     return;
   }
 
@@ -216,7 +310,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     session.longitud = null;
     session.paso = "PIDIENDO_NOMBRE";
     await saveSession(env, session);
-    await sendText(env, phone, "Perfecto. ¿A nombre de quién registramos el pedido?");
+      await sendText(env, phone, "Perfecto. ¿A nombre de quién registramos el pedido?");
     return;
   }
   if (session.paso === "PIDIENDO_NOMBRE" && text) {
@@ -227,7 +321,10 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     } else {
       session.paso = "PIDIENDO_DIRECCION";
       await saveSession(env, session);
-      await sendText(env, phone, "Gracias. Escríbeme la dirección completa para el domicilio (barrio, calle/carrera, número y alguna referencia).");
+      await sendButtons(env, phone, "Gracias. Escríbeme la dirección completa para el domicilio (barrio, calle/carrera, número y alguna referencia).", [
+        { id: "HUMAN", title: "Hablar encargado" },
+        { id: "CANCEL_ORDER", title: "Cancelar" },
+      ]);
     }
     return;
   }
@@ -238,6 +335,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     await sendButtons(env, phone, "Ahora comparte tu ubicación en tiempo real o ubicación actual desde el clip ➕ → Ubicación → Enviar ubicación actual. Cuando WhatsApp la envíe, la guardaré en el pedido.", [
       { id: "SKIP_LOCATION", title: "Omitir ubicación" },
       { id: "HUMAN", title: "Hablar encargado" },
+      { id: "CANCEL_ORDER", title: "Cancelar" },
     ]);
     return;
   }
@@ -277,22 +375,16 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
     const deliveryMethod = session.metodo_entrega;
     const orderId = await saveOrder(env, session);
     await sendText(env, phone, `¡Pedido recibido! ✅\nGracias por elegir La Salvajada de Willian. Si necesitas ayuda, escribe “Hablar con un encargado”.`);
-    await sendText(env, phone, `Si necesitas hacer un cambio antes de que empecemos a prepararlo, escribe:\n1. Cancelar pedido\n2. Agregar algo`);
+    await sendButtons(env, phone, "¿Qué deseas hacer con tu pedido antes de que empecemos a prepararlo?", [
+      { id: "ADD_ORDER", title: "1. Agregar algo" },
+      { id: "CANCEL_ORDER", title: "2. Cancelar" },
+    ]);
     if (env.OWNER_WHATSAPP) {
       const deliveryDetails = deliveryMethod === "RECOGER" ? "Recoge en el local" : `Domicilio: ${orderAddress}`;
       await sendText(env, env.OWNER_WHATSAPP, `Nuevo pedido #${orderId}\nCliente: ${orderName} (${phone})\n${deliveryDetails}\nPago: ${paymentMethod}\n${cartSummary(orderCart)}`);
     }
     return;
   }
-  if (id === "CANCEL_ORDER") {
-    session.paso = "INICIO";
-    session.carrito_json = "[]";
-    await saveSession(env, session);
-    await sendText(env, phone, "Pedido cancelado. Cuando quieras, puedes comenzar de nuevo.");
-    await showHome(env, phone);
-    return;
-  }
-
   if (message.type === "location" && message.location) {
     session.latitud = message.location.latitude;
     session.longitud = message.location.longitude;
@@ -308,7 +400,7 @@ export async function handleMessage(env: Env, message: WhatsAppMessage): Promise
   }
   if (session.paso === "ELIGIENDO_PRODUCTOS") {
     await sendText(env, phone, "Elige un producto de la lista. También puedes escribir “Hablar con un encargado”.");
-    await showMenu(env, phone);
+    await showMenu(env, phone, true);
     return;
   }
   await showHome(env, phone);
