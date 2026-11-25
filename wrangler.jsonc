@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bot-restaurante-whatsapp",
+  "main": "src/index.ts",
+  "assets": {
+    "directory": "./public"
+  },
+  "compatibility_date": "2026-11-24",
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "bot-restaurante-db",
+      "database_id": "a6031931-e937-4e34-8799-dba4f3d50b2a",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "GRAPH_API_VERSION": "v27.0",
+    "RESTAURANT_NAME": "La Salvajada de Willian",
+    "PHONE_NUMBER_ID": "1427382927127110",
+    "OWNER_WHATSAPP": ""
+  }
+}

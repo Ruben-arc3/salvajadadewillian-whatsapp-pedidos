@@ -1,0 +1,2 @@
+ALTER TABLE sesiones ADD COLUMN metodo_entrega TEXT;
+ALTER TABLE pedidos ADD COLUMN metodo_entrega TEXT NOT NULL DEFAULT 'DOMICILIO';
